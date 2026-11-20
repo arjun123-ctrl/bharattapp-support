@@ -5,13 +5,13 @@ The Next.js App Router app serves ARKNP’s public pages and a restricted WhatsA
 ## Run locally on Windows
 
 ```powershell
-if (!(Test-Path .env.local)) { Copy-Item .env.example .env.local }
 npm.cmd ci
-npm.cmd run admin -- admin@example.com "ARKNP Administrator"
+# Optional: configure a password for production sign-in.
+# npm.cmd run admin -- admin@example.com "ARKNP Administrator"
 npm.cmd run dev
 ```
 
-Sign in at http://localhost:3000/login. The admin command prompts for a password and updates the bootstrap account and password hash in the ignored `.env.local` file. Restart Next.js to apply the bootstrap configuration. Configure Meta credentials in `.env.local`; keep `.env.example` as a blank template. Skip dependency installation if dependencies are already present.
+Open http://localhost:3000/dashboard/conversations. Local development opens the workspace directly and listens on loopback. Production requires sign-in. The admin command prompts for a password and updates the bootstrap account and password hash in the ignored `.env.local` file. Restart Next.js to apply the bootstrap configuration. Configure Meta credentials in `.env.local`. Skip dependency installation if dependencies are already present.
 
 ## Verification
 

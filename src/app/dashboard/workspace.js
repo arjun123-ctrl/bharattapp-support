@@ -3,6 +3,8 @@ import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { api } from "../_components/public-form";
+import { messageReactions, reactionLifetime } from "@/lib/message-reactions.mjs";
+import { TemplateLibrary } from "./template-editor";
 
 const navigation = [
   ["Overview","", "◫"],["Conversations","conversations","▤"],["Contacts","contacts","◎"],["Templates","templates","▧"],
@@ -57,7 +59,7 @@ export function Workspace(props) {
       {overview.length ? <div className="rows">{overview.slice(0,8).map((item) => <Link key={item.id} href={"/dashboard/conversations?id="+item.id}><Avatar item={item}/><strong>{name(item)}</strong><span>{item.preview || item.status}</span><small>{date(item.last_message)}</small></Link>)}</div>
       : <p className="empty">Conversations appear here after a customer messages a connected WhatsApp number.</p>}
     </section></div></>;
-  return <Management section={section}/>;
+  return <Management section={section} admin={admin}/>;
 }
 function Avatar({item}) { return <span aria-hidden="true" className="avatar">{(item.name || "WA").slice(0,2).toUpperCase()}</span>; }
 
@@ -114,8 +116,8 @@ function Inbox({admin,team,contacts,initialId}) {
       {(page > 0 || current?.items.length > 30) && <div className="pager"><button className="secondary" disabled={!page} onClick={() => setPage(page-1)}>Previous</button><button className="secondary" disabled={current?.items.length <= 30} onClick={() => setPage(page+1)}>Next</button></div>}
     </section>
     {!selected ? <section className="conversation empty-state"><span aria-hidden="true">▤</span><h2>{contacts ? "Select a customer" : "Select a conversation"}</h2><p>{contacts ? "View contact details and consent records." : "Open a conversation to view messages and reply."}</p></section>
-      : <><Chat key={selected.id} thread={selected} messages={current.messages} before={before} setBefore={setBefore} contacts={contacts} refresh={() => refresh(revision+1)} back={() => {setId(0);setBefore(null);}}/>
-      <Details key={selected.id} thread={selected} admin={admin} team={team} refresh={() => refresh(revision+1)}/></>}
+      : <><Chat key={"chat:"+selected.id} thread={selected} messages={current.messages} before={before} setBefore={setBefore} contacts={contacts} refresh={() => refresh(revision+1)} back={() => {setId(0);setBefore(null);}}/>
+      {contacts && <Details key={"details:"+selected.id} thread={selected} admin={admin} team={team} refresh={() => refresh(revision+1)}/>}</>}
     </div></>;
 }
 function Attachment({message}) {
@@ -125,12 +127,62 @@ function Attachment({message}) {
   /* eslint-disable @next/next/no-img-element */
   if (message.kind === "image") return <a href={url} target="_blank" rel="noreferrer"><img loading="lazy" src={url} alt={message.body || "WhatsApp image"}/></a>;
   /* eslint-enable @next/next/no-img-element */
-  if (message.kind === "audio") return <audio controls preload="none" src={url}/>;
+  if (message.kind === "audio") return <audio aria-label="Voice message" controls preload="none" src={url}/>;
   if (message.kind === "video") return <video controls preload="none" src={url}/>;
   return <a href={url}>Download document</a>;
 }
 const templateText = (item) => item?.components?.find((component) => component.type === "BODY")?.text || "";
 const slots = (item) => [...new Set([...templateText(item).matchAll(/{{(\d+)}}/g)].map((match) => Number(match[1])))].sort((a,b)=>a-b);
+const chatTime = new Intl.DateTimeFormat("en-IN",{timeStyle:"short",timeZone:"Asia/Kolkata"});
+const deliveryMark = {pending:"…",unknown:"?",accepted:"✓",sent:"✓",delivered:"✓✓",read:"✓✓",failed:"!"};
+const quotedMediaLabels = {image:"Photo",audio:"Audio message",video:"Video",document:"Document",sticker:"Sticker"};
+function QuotedMessage({message}) {
+  return <blockquote className="quoted-message"><strong>Quoted message</strong>
+    {message ? <>
+      {message.kind === "image" && message.media && <Attachment message={message}/>}
+      <span>{message.body || quotedMediaLabels[message.kind] || message.kind || "Message"}</span>
+    </> : <span>Original message unavailable</span>}
+  </blockquote>;
+}
+function MessageActions({message,canReply,canReact,onReply,onAction}) {
+  const menu = useRef(null);
+  const trigger = useRef(null);
+  const [busy,setBusy] = useState(false);
+  async function perform(action,value) {
+    setBusy(true);
+    try {
+      if (await onAction(message,action,value) && menu.current) {
+        menu.current.open = false;
+        trigger.current.focus();
+      }
+    } finally { setBusy(false); }
+  }
+  return <details className="message-actions" ref={menu} onBlur={event => {
+    if (!event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open = false;
+  }} onKeyDown={event => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      menu.current.open = false;
+      trigger.current.focus();
+    }
+  }}>
+    <summary ref={trigger} aria-label="Message actions" title="Message actions" onClick={event => {
+      const anchor = event.currentTarget.getBoundingClientRect();
+      const timeline = event.currentTarget.closest(".timeline").getBoundingClientRect();
+      menu.current.dataset.side = timeline.bottom-anchor.bottom < 180 && anchor.top-timeline.top > timeline.bottom-anchor.bottom ? "above" : "below";
+    }}>⋯</summary>
+    <div className="message-action-panel">
+      {canReply && <button type="button" className="secondary" onClick={() => {menu.current.open=false;onReply(message);}}>Reply</button>}
+      {message.body && <button type="button" className="secondary" disabled={busy} onClick={() => perform("copy")}>Copy text</button>}
+      {message.media && <a href={"/api/workspace/media?id="+message.id} download>Download attachment</a>}
+      <button type="button" className="secondary" disabled={busy} onClick={() => perform(message.starred ? "unstar" : "star")}>{message.starred ? "Remove star" : "Star message"}</button>
+      {canReact && <div className="message-reaction-options" aria-label="React to message">
+        {messageReactions.map(emoji => <button key={emoji} type="button" aria-label={"React "+emoji} aria-pressed={message.reaction===emoji}
+          className="secondary" disabled={busy} onClick={() => perform("react",message.reaction===emoji ? "" : emoji)}>{emoji}</button>)}
+      </div>}
+    </div>
+  </details>;
+}
 function Chat({thread,messages,before,setBefore,contacts,refresh,back}) {
   const [available,setAvailable] = useState([]);
   const [template,setTemplate] = useState("");
@@ -141,6 +193,10 @@ function Chat({thread,messages,before,setBefore,contacts,refresh,back}) {
   const [delivery,setDelivery] = useState("");
   const [now,setNow] = useState(() => Date.now());
   const [file,setFile] = useState("");
+  const [templatesOpen,setTemplatesOpen] = useState(false);
+  const [templatesLoading,setTemplatesLoading] = useState(false);
+  const attachment = useRef(null);
+  const composerInput = useRef(null);
   const lock = useRef(false);
   const end = useRef(null);
   const latest = messages.at(-1)?.id;
@@ -153,10 +209,31 @@ function Chat({thread,messages,before,setBefore,contacts,refresh,back}) {
   const expiry = thread.last_inbound ? thread.last_inbound+86400000 : 0;
   const windowOpen = expiry > now;
   const chosen = available.find((item) => item.id === template);
+  async function messageAction(message,action,emoji) {
+    setError("");
+    setDelivery("");
+    try {
+      if (action === "copy") {
+        await navigator.clipboard.writeText(message.body);
+        setDelivery("Message copied.");
+      } else {
+        await api("message-action",formOf({id:thread.id,message:message.id,action,emoji}));
+        refresh();
+      }
+      return true;
+    } catch (error) {
+      setError(action === "copy" ? "Could not copy the message." : error.message);
+      return false;
+    }
+  }
   async function loadTemplates() {
+    setTemplatesOpen(!templatesOpen);
+    if (templatesOpen || templatesLoading) return;
+    setTemplatesLoading(true);
     setError("");
     try { setAvailable((await api("templates")).filter((item) => item.status==="APPROVED" && (item.category!=="MARKETING" || thread.opt_in==="yes"))); }
     catch (error) { setError(error.message); }
+    finally { setTemplatesLoading(false); }
   }
   async function submit(event) {
     event.preventDefault();
@@ -170,8 +247,8 @@ function Chat({thread,messages,before,setBefore,contacts,refresh,back}) {
     form.set("reply",reply?.meta_id || "");
     try {
       const result = await api("send",form);
-      element.reset();setFile("");setTemplate("");setValues({});setReply(null);
-      setDelivery(result.delivery === "accepted" ? "Meta accepted the message." : "Message status: "+result.delivery);
+      element.reset();setFile("");setTemplate("");setValues({});setReply(null);setTemplatesOpen(false);
+      setDelivery(result.delivery === "accepted" ? "" : "Message status: "+result.delivery);
     } catch (error) { setError(error.message); }
     finally { lock.current = false;setWorking(false);refresh(); }
   }
@@ -181,25 +258,58 @@ function Chat({thread,messages,before,setBefore,contacts,refresh,back}) {
       {before && <button className="secondary" onClick={() => setBefore(null)}>Latest messages</button>}
       {!messages.length && <p className="empty">No messages on this page.</p>}
       {messages.slice(-50).map((message) => <article key={message.id} className={"bubble "+message.direction}>
-        {message.reply_to && <blockquote>{message.quoted || "Reply to earlier message"}</blockquote>}
+        {message.reply_to && <QuotedMessage message={message.quoted}/>}
         <Attachment message={message}/>
-        {message.body ? <p>{message.body}</p> : !message.media && <p>{message.kind}</p>}
-        <small>{date(message.stamp)}{message.direction === "out" && " · "+message.status}{message.error_code && " · "+message.error_code}</small>
+        <div className="bubble-line">
+          {message.body ? <p>{message.body}</p> : !message.media && <p>{message.kind}</p>}
+          <small className="bubble-meta" title={date(message.stamp)}>
+            <time dateTime={new Date(message.stamp).toISOString()}>{chatTime.format(message.stamp)}</time>
+            {message.direction === "out" && <span className="delivery-mark" data-status={message.status} role="img"
+              aria-label={message.status + (message.error_code ? " · " + message.error_code : "")}
+              title={message.status + (message.error_code ? " · " + message.error_code : "")}>{deliveryMark[message.status] || message.status}</span>}
+          </small>
+        </div>
         {(message.status === "unknown" || message.status === "pending") && message.direction === "out" && <small>Check delivery before sending again.</small>}
-        {message.direction === "in" && !contacts && windowOpen && <button className="text-button" onClick={() => setReply(message)}>Reply</button>}
+        {message.direction === "out" && message.status === "failed" && message.error_code === "131042" &&
+          <small>Delivery failed · Meta billing issue (131042). <a href="https://business.facebook.com/wa/manage/" target="_blank" rel="noreferrer">Check WhatsApp billing</a></small>}
+        {(message.starred || message.reaction) && <div className="message-markers">
+          {message.starred && <span title="Starred" aria-label="Starred">★</span>}
+          {message.reaction && <span title="Your reaction">{message.reaction}</span>}
+        </div>}
+        {!contacts && <MessageActions message={message} canReply={windowOpen && message.direction === "in" && Boolean(message.meta_id)}
+          canReact={windowOpen && Boolean(message.meta_id) && message.kind !== "reaction" && !["pending","unknown","failed"].includes(message.status) && now-message.stamp < reactionLifetime}
+          onReply={message => {setReply(message);setTemplate("");setValues({});requestAnimationFrame(() => composerInput.current?.focus());}} onAction={messageAction}/>}
       </article>)}<div ref={end}/>
     </div>
     {!contacts && <form className="composer" onSubmit={submit}>
       {!windowOpen && <p className="notice">Customer service window expired. Send an approved WhatsApp template to continue.</p>}
       {reply && !template && windowOpen && <p className="notice">Replying to {reply.body || reply.kind} <button className="text-button" type="button" onClick={() => setReply(null)}>Clear reply</button></p>}
       <Status error={error} message={delivery}/>
-      <div className="composer-tools"><button className="secondary" type="button" onClick={loadTemplates}>Load approved templates</button>
-        <select name="template" aria-label="Approved template" value={template} onChange={(event)=>{setTemplate(event.target.value);setValues({});}}><option value="">Select template</option>{available.map((item)=><option key={item.id} value={item.id}>{item.name} ({item.language})</option>)}</select></div>
+      <div id="composer-template-picker" className="composer-template-picker" hidden={!templatesOpen}>
+        <label htmlFor="composer-template">Approved template</label>
+        <select id="composer-template" name="template" disabled={templatesLoading} value={template} onChange={(event)=>{setTemplate(event.target.value);setValues({});}}>
+          <option value="">{templatesLoading ? "Loading templates…" : available.length ? "Select template" : "No approved templates available"}</option>
+          {available.map((item)=><option key={item.id} value={item.id}>{item.name} ({item.language})</option>)}
+        </select>
+      </div>
       {chosen ? <div className="form"><p className="notice">{templateText(chosen).replace(/{{(\d+)}}/g,(match,index)=>values[index]||match)}</p>{slots(chosen).map((index)=><label key={index}>Variable {index}<input name="variable" required maxLength={1024} value={values[index] || ""} onChange={(event)=>setValues({...values,[index]:event.target.value})}/></label>)}</div>
-        : windowOpen && <><textarea name="body" maxLength={4096} rows={2} placeholder="Write a message…" aria-label="Message" onKeyDown={(event) => {
-          if (event.key==="Enter" && (event.ctrlKey||event.metaKey) && !event.nativeEvent.isComposing) {event.preventDefault();event.currentTarget.form.requestSubmit();}
-        }}/><label className="file-label">Attachment{file && " · "+file}<input type="file" name="attachment" accept="image/png,image/jpeg,application/pdf,audio/mpeg,audio/ogg,video/mp4" onChange={(event)=>setFile(event.target.files[0]?.name || "")}/></label></>}
-      <button disabled={working || (!chosen && !windowOpen)}>{working ? "Sending…" : "Send message"}</button>
+        : null}
+      {file && windowOpen && !chosen && <div className="composer-file"><span>{file}</span><button className="text-button" type="button" onClick={() => {attachment.current.value="";setFile("");}}>Remove attachment</button></div>}
+      <div className="composer-bar">
+        <button className="secondary composer-icon" type="button" aria-label="Choose approved template" title="Choose approved template"
+          aria-expanded={templatesOpen} aria-controls="composer-template-picker" onClick={loadTemplates}><span className="composer-template-icon" aria-hidden="true"/></button>
+        <input hidden ref={attachment} type="file" name="attachment" disabled={!windowOpen || Boolean(chosen)}
+          accept="image/png,image/jpeg,application/pdf,audio/mpeg,audio/ogg,video/mp4"
+          onChange={(event)=>setFile(event.target.files[0]?.name || "")}/>
+        {windowOpen && !chosen && <>
+          <button className="secondary composer-icon" type="button" aria-label="Attach image or file" title="Attach image or file"
+            onClick={() => attachment.current?.click()}><span className="composer-image-icon" aria-hidden="true"/></button>
+          <textarea ref={composerInput} name="body" maxLength={4096} rows={1} placeholder="Type a message…" aria-label="Message" onKeyDown={(event) => {
+            if (event.key==="Enter" && (event.ctrlKey||event.metaKey) && !event.nativeEvent.isComposing) {event.preventDefault();event.currentTarget.form.requestSubmit();}
+          }}/>
+        </>}
+        <button className="composer-send" disabled={working || (Boolean(chosen) && templatesLoading) || (!chosen && !windowOpen)}>{working ? "Sending…" : "Send"}</button>
+      </div>
     </form>}
   </section>;
 }
@@ -235,7 +345,7 @@ const definitions = {
   "deletion-requests":["Data Deletion Requests","Review privacy and support requests.","requests"],
   logs:["Logs","Administrative actions and Meta API diagnostics.","logs"],
 };
-function Management({section}) {
+function Management({section,admin}) {
   const [label,detail,resource] = definitions[section];
   const [data,setData] = useState(null);
   const [error,setError] = useState("");
@@ -247,6 +357,21 @@ function Management({section}) {
     api(resource).then((value) => {if(active)setData(value);}).catch((error) => {if(active)setError(error.message);});
     return () => {active=false;};
   },[resource]);
+  async function refreshTemplates() {
+    setError("");
+    try { setData(await api("templates")); }
+    catch (error) { setError(error.message); }
+  }
+  async function submitTemplate(form) {
+    setPending(true);setError("");setMessage("");
+    try {
+      const {id,status} = await api("templates",form);
+      setMessage("Submitted to Meta. Status: " + (status || "Check Meta templates") + (id ? " ? ID " + id : ""));
+      await refreshTemplates();
+      return true;
+    } catch (error) {setError(error.message);return false;}
+    finally {setPending(false);}
+  }
   async function mutate(form) {
     setPending(true);setError("");setMessage("");
     try {const value=await api(resource,form);setResult(value);setMessage(value.accepted ? "Meta accepted the authorized test message." : "Action completed.");setData(await api(resource));return true;}
@@ -271,7 +396,7 @@ function Management({section}) {
       <details><summary>Webhook setup</summary><p>In your Meta app, configure the callback URL and matching verification token. Subscribe to the WhatsApp Business Account messages field, then subscribe the app to your WABA and send a test message.</p></details>
       <h2>Recent API errors</h2><LogRows rows={data.errors}/></section>}
     {data && resource === "logs" && <section className="panel"><h2>Recent events</h2><LogRows rows={data}/></section>}
-    {data && resource === "templates" && <section className="panel"><h2>Meta templates</h2>{!data.length && <p className="empty">No templates found.</p>}{data.map((item)=><TemplatePreview key={item.id} item={item}/>)}</section>}
+    {resource === "templates" && <TemplateLibrary data={data} admin={admin} busy={pending} refresh={refreshTemplates} submit={submitTemplate}/>}
     {data && resource === "requests" && <section className="panel"><h2>Request queue</h2>{!data.length && <p className="empty">No customer requests.</p>}
       {data.map((item)=><details key={item.ref} className="request-row"><summary>{item.kind} · {item.status} · {date(item.created)}</summary><p>Reference {item.ref}</p>
         {item.resolved ? <p>Resolved {date(item.resolved)}</p> : <><p>{item.name} · +{item.phone} {item.email && " · "+item.email}</p><p className="pre">{item.details}</p>
@@ -282,12 +407,6 @@ function Management({section}) {
         </form></>}
       </details>)}</section>}
   </div></>;
-}
-function TemplatePreview({item}) {
-  const [values,setValues] = useState({});
-  return <details className="request-row"><summary>{item.name} · {item.language} · {item.category} · {item.status}</summary>
-    <p className="pre">{templateText(item).replace(/{{(\d+)}}/g,(match,index)=>values[index]||match)}</p>
-    <div className="form">{slots(item).map((index)=><label key={index}>Variable {index}<input maxLength={1024} value={values[index] || ""} onChange={(event)=>setValues({...values,[index]:event.target.value})}/></label>)}</div></details>;
 }
 function LogRows({rows}) {
   return rows.length ? <div className="rows">{rows.map((row,index)=><article key={row.id || index}><strong>{row.event.replaceAll("_"," ")}</strong><span>{row.detail || "—"}</span><small>{date(row.stamp)}{row.actor ? " · User "+row.actor : ""}</small></article>)}</div>

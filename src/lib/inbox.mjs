@@ -26,14 +26,18 @@ export function list(user,{query="",filter="",page=0}={}) {
 export function timeline(id,before) {
   const messages = rows("messages").filter((row)=>row.conversation_id===id).sort(newest);
   const start = before ? messages.findIndex((row)=>row.id===before)+1 : 0;
-  const quotes = new Map(messages.filter((row)=>row.meta_id).map((row)=>[row.meta_id,row.body]));
+  const quotes = new Map(messages.filter((row)=>row.meta_id).map(({meta_id,id,body,kind,media}) =>
+    [meta_id,{id,body,kind,media:Boolean(media)}]));
   return messages.slice(start,start+51).reverse().map((row)=>({...row,quoted:quotes.get(row.reply_to)}));
 }
 export function snapshot(user, id, query, filter, page, before) {
   pruneCache();
   const selected = id ? thread(user,id) : null;
   if (id && !selected) return null;
-  return { items: list(user, { query, filter, page }), selected, messages: selected ? timeline(id,before) : [] };
+  const messages = selected ? timeline(id,before).map(({starred_by,...message}) => ({
+    ...message, starred: Boolean(starred_by?.includes(user.id)),
+  })) : [];
+  return { items: list(user, { query, filter, page }), selected, messages };
 }
 export async function outbound(user, id, form, fetcher) {
   const current = thread(user, id);

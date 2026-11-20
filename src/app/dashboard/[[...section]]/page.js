@@ -1,12 +1,12 @@
-import { cookies } from "next/headers";
+import { cookies, headers } from "next/headers";
 import { notFound, redirect } from "next/navigation";
-import { cookieName, session } from "@/lib/security.mjs";
+import { cookieName, workspaceUser } from "@/lib/security.mjs";
 import { pendingRequests, users } from "@/lib/store.mjs";
 import { list } from "@/lib/inbox.mjs";
 import { Workspace } from "../workspace";
 
 export default async function DashboardPage({params,searchParams}) {
-  const user = session((await cookies()).get(cookieName)?.value);
+  const user = workspaceUser((await cookies()).get(cookieName)?.value, await headers());
   if (!user) redirect("/login");
   const section = (await params).section?.join("/") || "overview";
   const admin = user.role === "ADMIN";

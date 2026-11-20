@@ -32,11 +32,28 @@ export async function graph(path, body, fetcher = fetch) {
     body: body === undefined || multipart ? body : JSON.stringify(body),
     cache: "no-store", redirect: "error", signal: AbortSignal.timeout(12000),
   });
+  return graphResult(response);
+}
+async function graphResult(response) {
   const result = await response.json();
   if (!response.ok || result.error) {
     throw new GraphError(response.status, Number.isSafeInteger(result.error?.code) ? String(result.error.code) : "http_" + response.status);
   }
   return result;
+}
+export async function uploadTemplateImage(file) {
+  const appId = process.env.META_APP_ID;
+  if (!/^\d+$/.test(appId || "")) throw new Error("Missing Meta app ID");
+  const query = new URLSearchParams({file_name:file.name,file_length:String(file.size),file_type:file.type});
+  const session = await graph(appId + "/uploads?" + query,{});
+  if (typeof session.id !== "string" || !session.id.startsWith("upload:")) throw new Error("Invalid upload session");
+  const {version,token} = config();
+  const result = await graphResult(await fetch("https://graph.facebook.com/" + version + "/" + session.id, {
+    method:"POST", headers:{Authorization:"OAuth " + token,file_offset:"0","Content-Type":"application/octet-stream"},
+    body:await file.arrayBuffer(),redirect:"error",signal:AbortSignal.timeout(15000),
+  }));
+  if (typeof result.h !== "string" || !result.h) throw new Error("Missing sample image handle");
+  return result.h;
 }
 export async function templates() {
   const result = [];

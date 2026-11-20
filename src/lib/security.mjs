@@ -26,6 +26,23 @@ export function session(token) {
   const {id,name,email,role} = user;
   return {id,name,email,role};
 }
+export function localWorkspaceUser(headers) {
+  if (process.env.NODE_ENV !== "development") return null;
+  const loopback = /^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i;
+  const host = headers.get("host");
+  const forwardedHost = headers.get("x-forwarded-host");
+  if (!loopback.test(host || "") || (forwardedHost && !loopback.test(forwardedHost))) return null;
+  const admin = get("users", 1);
+  return {
+    id: 1,
+    name: admin?.name || "Local workspace",
+    email: admin?.email || "",
+    role: "ADMIN",
+  };
+}
+export function workspaceUser(token, headers) {
+  return localWorkspaceUser(headers) || session(token);
+}
 export function text(value, length) {
   return typeof value === "string" ? value.trim().slice(0, length) : "";
 }

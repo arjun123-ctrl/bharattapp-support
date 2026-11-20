@@ -5,9 +5,11 @@ export function verify(request, token = process.env.WHATSAPP_VERIFY_TOKEN) {
   const query = new URL(request.url).searchParams;
   const challenge = query.get("hub.challenge");
   if (!token || query.get("hub.mode") !== "subscribe" || !equal(query.get("hub.verify_token"), token) || challenge === null) {
+    if (query.get("hub.mode") === "subscribe") console.warn("[WhatsApp webhook] Verification rejected: check the verify token and challenge");
     return new Response("Forbidden", { status: 403 });
   }
   put("webhook_meta","verification",{key:"verification",stamp:Date.now()});
+  console.info("[WhatsApp webhook] Verification succeeded");
   return new Response(challenge, { headers: { "Content-Type": "text/plain" } });
 }
 const array = (value) => Array.isArray(value) ? value : [];
@@ -22,16 +24,29 @@ export function ingest(payload, { waba, phoneId }, now = Date.now(), deliveryKey
     put("webhook_meta","delivery",{key:"delivery",stamp:now});
     if (payload?.object !== "whatsapp_business_account") return;
     for (const entry of array(payload.entry)) {
-      if (entry?.id !== waba) continue;
+      if (entry?.id !== waba) {
+        console.warn("[WhatsApp webhook] Event ignored: WABA ID does not match META_WABA_ID");
+        continue;
+      }
       for (const change of array(entry.changes)) {
         const value = change?.value;
-        if (change?.field !== "messages" || value?.metadata?.phone_number_id !== phoneId) continue;
+        if (change?.field !== "messages") continue;
+        if (value?.metadata?.phone_number_id !== phoneId) {
+          console.warn("[WhatsApp webhook] Messages event ignored: phone number ID does not match WHATSAPP_PHONE_NUMBER_ID");
+          continue;
+        }
         for (const message of array(value.messages)) {
           const number = phone(message?.from);
           const id = text(message?.id, 512);
-          if (!number || !id) continue;
+          if (!number || !id) {
+            console.warn("[WhatsApp webhook] Incoming message ignored: missing sender phone number or message ID");
+            continue;
+          }
           const key = digest(id);
-          if (get("inbound_keys",key)) continue;
+          if (get("inbound_keys",key)) {
+            console.info("[WhatsApp webhook] Duplicate incoming message ignored");
+            continue;
+          }
           const receivedStamp = Number(message.timestamp) * 1000;
           const inboundStamp = Number.isSafeInteger(receivedStamp) && receivedStamp > 0 && receivedStamp <= now + 120000
             ? Math.min(receivedStamp, now) : null;
@@ -52,6 +67,7 @@ export function ingest(payload, { waba, phoneId }, now = Date.now(), deliveryKey
           insert("messages",{conversation_id:thread.id,meta_id:id,direction:"in",kind,body:text(body,4096),
             media:/^\d+$/.test(media) ? media : null,reply_to:text(message.context?.id,512) || null,status:"received",stamp});
           put("inbound_keys",key,now);
+          console.info("[WhatsApp webhook] Incoming message saved", { conversationId: thread.id });
         }
         for (const receipt of array(value.statuses)) {
           const id = text(receipt?.id, 512);
@@ -63,6 +79,7 @@ export function ingest(payload, { waba, phoneId }, now = Date.now(), deliveryKey
           const error = receipt.errors?.[0]?.code;
           const code = Number.isSafeInteger(error) ? String(error) : null;
           put("receipts",id,{status,stamp,error_code:code});
+          if (status === "failed") console.warn("[WhatsApp webhook] Outbound delivery failed", { code });
           const correlation = text(receipt.biz_opaque_callback_data,80);
           const outgoing = find("messages",(row)=>row.direction==="out" &&
             (row.meta_id===id || (!row.meta_id && correlation && row.request_id===correlation)));
@@ -74,15 +91,35 @@ export function ingest(payload, { waba, phoneId }, now = Date.now(), deliveryKey
   if (deliveryKey) remove("webhook_failures",deliveryKey);
 }
 export async function receive(request) {
+  console.info("[WhatsApp webhook] POST received");
   const { META_APP_SECRET: secret, META_WABA_ID: waba, WHATSAPP_PHONE_NUMBER_ID: phoneId } = process.env;
-  if (!secret || !waba || !phoneId) return new Response("Webhook unavailable", { status: 503 });
-  const raw = await boundedBody(request, 1024 * 1024);
-  if (!raw) return new Response("Payload too large", { status: 413 });
-  if (!signature(raw, request.headers.get("x-hub-signature-256"), secret)) return new Response("Forbidden", { status: 403 });
+  if (!secret || !waba || !phoneId) {
+    console.error("[WhatsApp webhook] Missing configuration", {
+      hasAppSecret: Boolean(secret), hasWabaId: Boolean(waba), hasPhoneNumberId: Boolean(phoneId),
+    });
+    return new Response("Webhook unavailable", { status: 503 });
+  }
+  let raw;
+  try { raw = await boundedBody(request, 1024 * 1024); } catch {
+    console.error("[WhatsApp webhook] Could not read request body");
+    return new Response("Could not read request body", { status: 503 });
+  }
+  if (!raw) {
+    console.warn("[WhatsApp webhook] POST rejected: payload too large");
+    return new Response("Payload too large", { status: 413 });
+  }
+  if (!signature(raw, request.headers.get("x-hub-signature-256"), secret)) {
+    console.warn("[WhatsApp webhook] POST rejected: missing or invalid signature");
+    return new Response("Forbidden", { status: 403 });
+  }
   let payload;
-  try { payload = JSON.parse(raw.toString("utf8")); } catch { return new Response("Invalid JSON", { status: 400 }); }
+  try { payload = JSON.parse(raw.toString("utf8")); } catch {
+    console.warn("[WhatsApp webhook] POST rejected: invalid JSON");
+    return new Response("Invalid JSON", { status: 400 });
+  }
   const key = digest(raw);
   try { ingest(payload, { waba, phoneId }, Date.now(), key); } catch {
+    console.error("[WhatsApp webhook] Processing failed; Meta can retry delivery");
     try {
       const attempts = (get("webhook_failures",key)?.attempts || 0)+1;
       put("webhook_failures",key,{attempts,stamp:Date.now()});

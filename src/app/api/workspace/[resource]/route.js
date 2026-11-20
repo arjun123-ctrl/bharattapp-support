@@ -1,8 +1,9 @@
 import { NextResponse } from "next/server";
 import { rows, get, find, put, remove, insert, update, users, pendingRequests, audit, limited } from "@/lib/store.mjs";
-import { authenticate, clientKey, cookieName, digest, email, hashPassword, nonce, phone, session, text } from "@/lib/security.mjs";
+import { authenticate, clientKey, cookieName, digest, email, hashPassword, localWorkspaceUser, nonce, phone, text, windowOpen, workspaceUser } from "@/lib/security.mjs";
+import { messageReactions, reactionLifetime } from "@/lib/message-reactions.mjs";
 import { outbound, snapshot, thread, timeline } from "@/lib/inbox.mjs";
-import { config, graph, GraphError, markRead, send, templates } from "@/lib/meta.mjs";
+import { config, graph, GraphError, markRead, send, templates, uploadTemplateImage } from "@/lib/meta.mjs";
 import { boundedBody } from "@/lib/webhook.mjs";
 import { reviewRequest, submitRequest, validateRequest } from "@/lib/requests.mjs";
 
@@ -35,7 +36,7 @@ function events(request, args) {
       }
       function tick() {
         try {
-          const user = session(token(request));
+          const user = workspaceUser(token(request), request.headers);
           const data = user && snapshot(user,...args);
           if (!data) {
             controller.enqueue("event: unavailable\ndata: {}\n\n");
@@ -56,11 +57,12 @@ function events(request, args) {
 }
 const metaFailure = (user, error) => {
   audit("meta_api_error",user.id,error instanceof GraphError ? error.code : "request_failed");
+  if (error instanceof GraphError && error.code === "190") return fail(502,"Meta rejected the WhatsApp access token. Update WHATSAPP_ACCESS_TOKEN with a valid token that has whatsapp_business_management permission.");
   return fail(502,error instanceof GraphError ? "Meta request failed, code " + error.code : "Check Meta configuration and connectivity.");
 };
 export async function GET(request, { params }) {
   const { resource } = await params;
-  const user = session(token(request));
+  const user = workspaceUser(token(request), request.headers);
   if (!user) return fail(401,"Sign in required");
   const q = request.nextUrl.searchParams;
   if (resource === "inbox" || resource === "events") {
@@ -110,18 +112,89 @@ export async function GET(request, { params }) {
 }
 export async function POST(request,{ params }) {
   const { resource } = await params;
-  if (request.headers.get("origin") !== siteOrigin(request)) return fail(403,"Invalid request origin");
+  const origin = request.headers.get("origin");
+  const localOrigin = localWorkspaceUser(request.headers) && origin === "http://" + request.headers.get("host");
+  if (origin !== siteOrigin(request) && !localOrigin) return fail(403,"Invalid request origin");
   const publicRoute = ["login","public"].includes(resource);
-  const user = session(token(request));
+  const user = workspaceUser(token(request), request.headers);
   if (!publicRoute && !user) return fail(401,"Sign in required");
-  if (["team","requests","settings"].includes(resource) && !admin(user)) return fail(403,"Administrator access required");
+  if (["team","requests","settings","templates"].includes(resource) && !admin(user)) return fail(403,"Administrator access required");
   const actor = user?.id || clientKey(request.headers);
   if (limited(resource + ":post:" + actor,publicRoute ? (resource === "login" ? 12 : 5) : 60,publicRoute ? 900000 : 60000)) return fail(429,"Too many requests. Try again later.");
-  const raw = await boundedBody(request,resource === "send" ? 17*1024*1024 : 24*1024);
+  const maximum = resource === "send" ? 17*1024*1024 : resource === "templates" ? 4*1024*1024 : 24*1024;
+  const raw = await boundedBody(request,maximum);
   if (!raw) return fail(413,"Submission too large");
   let form;
   try { form = await new Response(raw,{ headers: { "Content-Type":request.headers.get("content-type") || "" } }).formData(); }
   catch { return fail(400,"Invalid form"); }
+  if (resource === "templates") {
+    const name = text(form.get("name"),513);
+    const language = text(form.get("language"),10);
+    const category = form.get("category");
+    const body = text(form.get("body"),1025);
+    if (!/^[a-z0-9_]{1,512}$/.test(name)) return fail(400,"Use lowercase letters, numbers or underscores in the template name.");
+    if (!/^[a-z]{2,3}(?:_[A-Z]{2})?$/.test(language)) return fail(400,"Enter a Meta language code such as en_US or hi.");
+    if (!["UTILITY","MARKETING"].includes(category)) return fail(400,"Select Utility or Marketing.");
+    if (!body || body.length > 1024) return fail(400,"Enter a message body of up to 1024 characters.");
+    const placeholder = /{{([1-9]\d*)}}/g;
+    const indexes = [...new Set([...body.matchAll(placeholder)].map((match) => Number(match[1])))].sort((a,b) => a-b);
+    const examples = String(form.get("examples") || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (/{{|}}/.test(body.replace(placeholder,"")) || indexes.some((index,i) => index !== i+1) ||
+        examples.length !== indexes.length || examples.some((example) => example.length > 1024)) {
+      return fail(400,"Use consecutive variables like {{1}} and {{2}}, with one example per variable in order.");
+    }
+    const component = {type:"BODY",text:body};
+    if (examples.length) component.example = {body_text:[examples]};
+    const footer = text(form.get("footer"),61);
+    if (footer.length > 60 || /[\r\n]/.test(footer)) return fail(400,"Use up to 60 characters on one line for the footer.");
+    const image = form.get("image");
+    if (image?.size && (!["image/png","image/jpeg"].includes(image.type) || image.size > 3500000)) {
+      return fail(400,"Choose a PNG or JPEG image up to 3.5 MB.");
+    }
+    const labels = form.getAll("buttonLabel");
+    const types = form.getAll("buttonType");
+    const targets = form.getAll("buttonTarget");
+    const samples = form.getAll("buttonSample");
+    if (labels.length > 10 || [types,targets,samples].some(values => values.length !== labels.length)) return fail(400,"Invalid template buttons.");
+    const buttons = [];
+    for (let i = 0; i < labels.length; i++) {
+      const label = text(labels[i],21);
+      const target = text(targets[i],301);
+      if (!label || label.length > 20 || /[\r\n{}]/.test(label)) return fail(400,"Enter a button label of up to 20 characters.");
+      if (types[i] === "URL") {
+        const dynamic = target.endsWith("{{1}}");
+        const base = dynamic ? target.slice(0,-5) : target;
+        const sample = text(samples[i],301);
+        if (target.length > 300 || !/^https:\/\/[^\s{}]+$/.test(base) ||
+            (dynamic && (!sample.startsWith(base) || sample === base || /[\s{}]/.test(sample) || sample.length > 300))) {
+          return fail(400,"Use an HTTPS button URL. For a URL ending in {{1}}, provide its full sample URL.");
+        }
+        buttons.push({type:"URL",text:label,url:target,...(dynamic ? {example:[sample]} : {})});
+      } else if (types[i] === "PHONE_NUMBER" && /^\+?[1-9]\d{6,14}$/.test(target)) {
+        buttons.push({type:"PHONE_NUMBER",text:label,phone_number:"+" + target.replace(/^\+/,"")});
+      } else if (types[i] === "QUICK_REPLY") {
+        buttons.push({type:"QUICK_REPLY",text:label});
+      } else return fail(400,"Enter a phone number with country code or choose a valid button type.");
+    }
+    if (buttons.filter(button => button.type === "URL").length > 2 ||
+        buttons.filter(button => button.type === "PHONE_NUMBER").length > 1 ||
+        buttons.filter(button => button.type === "QUICK_REPLY").length > 8) return fail(400,"Too many buttons of the same type.");
+    const id = form.get("templateId");
+    if (id && (typeof id !== "string" || !/^\d+$/.test(id))) return fail(400,"Invalid template ID.");
+    try {
+      if (id && !(await templates()).some(item => String(item.id) === id && item.name === name && item.language === language)) {
+        return fail(404,"Template unavailable on this WhatsApp account.");
+      }
+      const components = [component];
+      if (image?.size) components.unshift({type:"HEADER",format:"IMAGE",example:{header_handle:[await uploadTemplateImage(image)]}});
+      if (footer) components.push({type:"FOOTER",text:footer});
+      if (buttons.length) components.push({type:"BUTTONS",buttons});
+      const result = id ? await graph(id,{category,components}) :
+        await graph(config().waba + "/message_templates",{name,language,category,components});
+      audit("template_submitted",user.id,name);
+      return json({id:result.id || id,status:result.status},id ? 200 : 201);
+    } catch (error) { return metaFailure(user,error); }
+  }
   if (resource === "login") {
     const address = email(form.get("email"));
     const password = form.get("password");
@@ -148,6 +221,34 @@ export async function POST(request,{ params }) {
     return json({ reference:submitRequest(input) },201);
   }
   const id = int(form.get("id"));
+  if (resource === "message-action") {
+    const current = thread(user,id);
+    const message = get("messages",int(form.get("message")));
+    if (!current || !message || message.conversation_id !== id) return fail(404,"Message unavailable");
+    const action = form.get("action");
+    if (action === "star" || action === "unstar") {
+      const starredBy = new Set(message.starred_by || []);
+      if (action === "star") starredBy.add(user.id);
+      else starredBy.delete(user.id);
+      update("messages",message.id,{starred_by:[...starredBy]});
+      return json({ok:true});
+    }
+    if (action !== "react") return fail(400,"Invalid message action");
+    const emoji = form.get("emoji");
+    if (emoji !== "" && !messageReactions.includes(emoji)) return fail(400,"Choose a supported reaction");
+    if (!windowOpen(current.last_inbound) || !message.meta_id || message.kind === "reaction" ||
+        ["pending","unknown","failed"].includes(message.status) || Date.now()-message.stamp >= reactionLifetime) {
+      return fail(409,"This message is no longer eligible for reactions");
+    }
+    if (current.phone_id !== configSafePhone()) return fail(409,"Conversation uses a different WhatsApp number");
+    if (limited("reaction:" + user.id,25,60000)) return fail(429,"Reaction limit reached");
+    try {
+      const result = await send(current.wa_id,"reaction",{message_id:message.meta_id,emoji});
+      if (!result.messages?.[0]?.id) return fail(502,"Meta did not confirm the reaction");
+      update("messages",message.id,{reaction:emoji});
+      return json({ok:true});
+    } catch (error) { return metaFailure(user,error); }
+  }
   if (resource === "send") {
     const { status,...result } = await outbound(user,id,form);
     return json(result,status);
